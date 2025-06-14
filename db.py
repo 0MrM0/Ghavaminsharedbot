@@ -1,75 +1,106 @@
-# db.py (نسخه جدید با پشتیبانی از PostgreSQL)
+# db.py
+# این فایل شامل توابع مربوط به مدیریت دیتابیس SQLite است.
 
-import os
-import psycopg2
+import sqlite3
 import logging
-from typing import Optional
+import os
+from typing import Optional, Tuple
+
+# نام فایل دیتابیس
+DATABASE_NAME = "stock_data.db"
 
 # پیکربندی لاگ‌ها
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
-def get_db_connection() -> Optional[psycopg2.extensions.connection]:
-    """برای اتصال به دیتابیس PostgreSQL با استفاده از DATABASE_URL"""
-    database_url = os.environ.get('DATABASE_URL')
-    if not database_url:
-        # اگر این اسکریپت به صورت محلی برای وارد کردن داده‌ها اجرا شود، از متغیر دیگری استفاده می‌کند
-        database_url = os.environ.get('DATABASE_URL_LOCAL')
-
-    if not database_url:
-        logger.error("آدرس دیتابیس یافت نشد. متغیر محیطی DATABASE_URL یا DATABASE_URL_LOCAL را تنظیم کنید.")
-        return None
-
+def get_db_connection() -> Optional[sqlite3.Connection]:
+    """
+    اتصال به دیتابیس SQLite و بازگرداندن شیء اتصال.
+    اگر دیتابیس موجود نباشد، آن را ایجاد می‌کند.
+    """
     try:
-        conn = psycopg2.connect(database_url)
-        logger.info("Successfully connected to PostgreSQL database.")
+        conn = sqlite3.connect(DATABASE_NAME)
+        conn.row_factory = sqlite3.Row # برای دسترسی به ستون‌ها با نام
+        logger.info(f"Connected to database: {DATABASE_NAME}")
         return conn
-    except psycopg2.OperationalError as e:
-        logger.error(f"Error connecting to PostgreSQL database: {e}")
+    except sqlite3.Error as e:
+        logger.error(f"Error connecting to database {DATABASE_NAME}: {e}")
         return None
 
-def create_shares_table(conn: psycopg2.extensions.connection):
-    """جدول 'shares' را در دیتابیس ایجاد می‌کند اگر وجود نداشته باشد."""
-    with conn.cursor() as cur:
-        cur.execute("""
+def create_shares_table(conn: sqlite3.Connection):
+    """
+    جدول 'shares' را در دیتابیس ایجاد می‌کند اگر وجود نداشته باشد.
+    این تابع انتظار دارد یک شیء اتصال (conn) را به عنوان ورودی بگیرد.
+    """
+    try:
+        cursor = conn.cursor()
+        cursor.execute('''
             CREATE TABLE IF NOT EXISTS shares (
-                id SERIAL PRIMARY KEY,
-                national_code VARCHAR(10) UNIQUE NOT NULL,
-                total_shares INTEGER NOT NULL
-            );
-        """)
-        # ساخت ایندکس روی کدملی برای افزایش سرعت جستجو
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_national_code ON shares (national_code);")
-    conn.commit()
-    logger.info("Table 'shares' is ready.")
+                national_code TEXT PRIMARY KEY,
+                total_shares INTEGER
+            )
+        ''')
+        # نیازی به conn.commit() در اینجا نیست، زیرا xlsx_loader آن را پس از اتمام همه درج‌ها انجام می‌دهد.
+        logger.info("Table 'shares' ensured to exist.")
+    except sqlite3.Error as e:
+        logger.error(f"Error creating table 'shares': {e}")
+        raise # رخداد خطا را دوباره پرتاب می‌کنیم تا تابع فراخواننده از آن مطلع شود.
 
-def insert_share_data(cursor, national_code, total_shares):
-    """یک رکورد را در جدول درج می‌کند."""
-    cursor.execute(
-        "INSERT INTO shares (national_code, total_shares) VALUES (%s, %s)",
-        (national_code, total_shares)
-    )
+def insert_or_replace_share_data(cursor: sqlite3.Cursor, national_code: str, total_shares: int) -> None:
+    """
+    داده‌های سهم را با استفاده از یک cursor موجود در دیتابیس وارد یا جایگزین می‌کند.
+    این تابع نیازی به commit یا close کردن اتصال ندارد.
+    """
+    try:
+        cursor.execute(
+            "INSERT OR REPLACE INTO shares (national_code, total_shares) VALUES (?, ?)",
+            (national_code, total_shares)
+        )
+        # نیازی به logger.debug در اینجا نیست، چون برای هر ردیف بسیار زیاد می‌شود.
+        # logger.debug(f"Inserted/Replaced: {national_code}, {total_shares}")
+    except sqlite3.Error as e:
+        logger.error(f"Error inserting/replacing data for {national_code}: {e}")
+        # اینجا رخداد را پرتاب نمی‌کنیم تا پردازش سایر ردیف‌ها ادامه پیدا کند
+        # اما خطای خاص این ردیف را لاگ می‌کنیم.
 
 def get_shares_by_national_code(national_code: str) -> Optional[int]:
-    """تعداد سهام را بر اساس کدملی از دیتابیس PostgreSQL دریافت می‌کند."""
-    conn = get_db_connection()
-    if not conn:
-        return None
-
-    result_value = None
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT total_shares FROM shares WHERE national_code = %s",
+    """
+    تعداد سهام را بر اساس کدملی از دیتابیس دریافت می‌کند.
+    اگر یافت نشود، None برمی‌گرداند.
+    """
+    conn = get_db_connection() # این تابع فقط برای خواندن است، پس می‌تواند اتصال را خودش مدیریت کند.
+    if conn:
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT total_shares FROM shares WHERE national_code = ?",
                 (national_code,)
             )
-            result = cur.fetchone()
+            result = cursor.fetchone()
             if result:
-                result_value = result[0]
-    except psycopg2.Error as e:
-        logger.error(f"Error querying shares for {national_code}: {e}")
-    finally:
-        if conn:
+                return result['total_shares']
+            return None
+        except sqlite3.Error as e:
+            logger.error(f"Error querying shares for {national_code}: {e}")
+            return None
+        finally:
             conn.close()
-            
-    return result_value
+    return None
+
+if __name__ == '__main__':
+    # این بخش برای تست db.py است
+    conn_test = get_db_connection()
+    if conn_test:
+        try:
+            create_shares_table(conn_test)
+            cursor_test = conn_test.cursor()
+            insert_or_replace_share_data(cursor_test, "0061339326", 1500)
+            insert_or_replace_share_data(cursor_test, "111974", 200)
+            conn_test.commit() # Commit changes after all inserts
+            print(f"Shares for 0061339326: {get_shares_by_national_code('0061339326')}")
+            print(f"Shares for 111974: {get_shares_by_national_code('111974')}")
+            print(f"Shares for 9999999999: {get_shares_by_national_code('9999999999')}")
+        finally:
+            conn_test.close()
